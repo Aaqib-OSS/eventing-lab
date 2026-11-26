@@ -16,6 +16,9 @@ from __future__ import annotations
 import binascii
 import json
 import sys
+from types import SimpleNamespace
+
+from proclib import Result
 
 import k8s_demo_flow as flow
 import pytest
@@ -317,6 +320,49 @@ def test_the_signature_binds_the_PROMPT_not_just_the_envelope():
     ok, why = S.verify_request(tampered, _RequireCfg(), ks)
     assert not ok, "a swapped payload under a genuine signature must be refused"
     assert "does not verify" in why
+
+
+@pytest.mark.parametrize(
+    ("rc", "launched", "out", "err"),
+    [
+        (0, True, "", ""),  # kubectl succeeded, but the sentinel was not captured
+        (1, True, "", "kubectl could not capture pod output"),
+        (127, False, "", "not found"),  # kubectl never launched
+    ],
+)
+def test_forged_request_publish_result_is_logged_and_passed_to_check(rc, launched, out, err):
+    """Pod output is diagnostic; publish command failures are recorded, not gated."""
+    class _Kubectl:
+        def get(self, *_args, **_kwargs):
+            return {"data": {"KAFKA_BOOTSTRAP": "broker:9092",
+                             "REQUEST_TOPIC": "kev1-requests"}}
+
+        def call(self, argv, **_kwargs):
+            return Result(tuple(argv), rc, out, err, 0.01, launched=launched)
+
+    class _Checks:
+        def __init__(self):
+            self.messages = []
+            self.run_results = []
+
+        def log(self, message):
+            self.messages.append(message)
+
+        def expect_run(self, result, description):
+            self.run_results.append((result, description))
+
+    stage = flow.Flow.__new__(flow.Flow)
+    stage.k = _Kubectl()
+    stage.c = _Checks()
+    stage.ns = "kev1"
+    stage.args = SimpleNamespace(registry="registry", tag="local1")
+
+    stage._publish_forged_request("forged-regression")
+    assert len(stage.c.run_results) == 1
+    result = stage.c.run_results[0][0]
+    assert result.rc == rc
+    assert result.launched is launched
+    assert any("(no output captured)" in line for line in stage.c.messages)
 
 
 class _RequireCfg:
